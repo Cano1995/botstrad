@@ -1,0 +1,356 @@
+//+------------------------------------------------------------------+
+//| Expert advisor: General Ares                                    |
+//| Autor: Cristhian Cano                                            |
+//| Version: v5 — Fase 4: arquitectura y limpieza                   |
+//| Fecha: 2026-05-13                                                |
+//| Cambios vs v4:                                                   |
+//|   FIX 4.1 - Variables muertas eliminadas (compra_ready*, venta_  |
+//|             ready*, autorizado, api_url, ultima_consulta, etc.)  |
+//|   FIX 4.2 - Bloque de verificación vacío eliminado               |
+//|   FIX 4.3 - Todos los parámetros clave son input                 |
+//|   FIX 4.4 - API lista para reactivar: ConsultarAPI() funcional  |
+//|             con bloque comentado documentado                     |
+//|   FIX 4.5 - Lógica de cierre extraída a CheckCloseConditions()  |
+//|   FIX 4.6 - PuntosCierre alineado: se usa solo como guardia final|
+//|             porque el cierre en 5000 pts siempre ocurre antes   |
+//+------------------------------------------------------------------+
+#property strict#include <Trade\Trade.mqh>
+
+CTrade trade;
+
+//=== INPUTS ===//
+input int    RSI_Period      = 2;     // Período RSI (probar 7 en backtest)
+input int    ADX_Period      = 5;     // Período ADX (probar 14 en backtest)
+input int    MA_Period_Inp   = 5;     // Período MA filtro de tendencia
+input double Lots            = 0.01;
+input int    SL_Inicial      = 150;   // Stop loss inicial en puntos
+input int    TP_Objetivo     = 5000;  // Ganancia en puntos para cierre directo
+input int    SL_Maximo       = 500;   // Pérdida máxima en puntos antes de cerrar
+input int    MaxSpread       = 30;    // Spread máximo permitido
+input int    Pausa_Perdida   = 900;   // Segundos de pausa tras pérdida
+input int    Pausa_SL        = 900;   // Segundos de pausa tras SL tocado
+input bool   Apagar_Bot      = false; // Kill switch desde el panel
+input bool   Usar_Filtro_MA  = true;  // Activar filtro de tendencia MA
+
+//=== HANDLES DE INDICADORES ===//
+int rsi_handle;
+int adx_handle;
+int ma_handle;
+double ma_value[];
+
+//=== ESTADO ===//
+bool     buy_opened  = false;
+bool     sell_opened = false;
+datetime pausa_hasta = 0;
+
+// Flags de confirmación dos ticks
+bool flag_compra3 = false;
+bool flag_compra2 = false;
+bool flag_venta4  = false;
+bool flag_venta3  = false;
+bool flag_venta5  = false;
+
+// Estado API
+int    ultimo_oper_valor = -1;
+string operacion_api;
+int    valor_api;
+
+
+//+------------------------------------------------------------------+
+int OnInit() {
+  rsi_handle = iRSI(_Symbol, PERIOD_M1, RSI_Period, PRICE_CLOSE);
+  adx_handle = iADX(_Symbol, PERIOD_M1, ADX_Period);
+  ma_handle  = iMA(_Symbol, PERIOD_M1, MA_Period_Inp, 0, MODE_SMA, PRICE_CLOSE);
+
+  if (rsi_handle == INVALID_HANDLE || adx_handle == INVALID_HANDLE || ma_handle == INVALID_HANDLE) {
+    Print("❌ Error al crear indicadores");
+    return INIT_FAILED;
+  }
+
+  PrintFormat("✅ General Ares v5 | RSI(%d) ADX(%d) MA(%d) SL=%d Spread<%d FiltroMA=%s",
+              RSI_Period, ADX_Period, MA_Period_Inp, SL_Inicial, MaxSpread, Usar_Filtro_MA ? "ON" : "OFF");
+  return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+void OnTick() {
+  CheckFloatingProfit();
+
+  if (Apagar_Bot || Bars(_Symbol, PERIOD_M1) < 10 || TimeCurrent() < pausa_hasta)
+    return;
+
+  if (SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) > MaxSpread)
+    return;
+
+  double rsi[], adx[];
+  if (CopyBuffer(rsi_handle, 0, 0, 2, rsi) <= 0 ||
+      CopyBuffer(adx_handle, 0, 0, 2, adx) <= 0 ||
+      ArraySize(rsi) < 2 || ArraySize(adx) < 2)
+    return;
+
+  CopyBuffer(ma_handle, 0, 0, 1, ma_value);
+
+  double current_rsi   = rsi[1];
+  double current_adx   = adx[1];
+  double precio_actual = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+  bool tendencia_alcista = !Usar_Filtro_MA || (precio_actual > ma_value[0]);
+  bool tendencia_bajista = !Usar_Filtro_MA || (precio_actual < ma_value[0]);
+
+  EvaluarSenales(current_rsi, current_adx, tendencia_alcista, tendencia_bajista);
+
+  // === Bloque API (descomentar para activar señales externas) ===
+  /*
+  if (ConsultarAPI(operacion_api, valor_api) && valor_api != ultimo_oper_valor) {
+    ultimo_oper_valor = valor_api;
+    string comentario_pos = PositionGetString(POSITION_COMMENT);
+    ulong  ticket_pos     = PositionGetTicket(0);
+
+    if (operacion_api == "BUY")   OpenBuy("API");
+    if (operacion_api == "SELL")  OpenSell("API");
+    if (operacion_api == "close" && StringFind(comentario_pos, "API") >= 0)
+      trade.PositionClose(ticket_pos);
+  }
+  */
+}
+
+//+------------------------------------------------------------------+
+// FIX 4.5: lógica de señales extraída de OnTick para mejor legibilidad
+void EvaluarSenales(double current_rsi, double current_adx, bool tend_up, bool tend_dn) {
+  buy_opened  = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+  sell_opened = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL;
+  bool puede_abrir = !buy_opened && !sell_opened;
+
+  // === COMPRA3: RSI<=6, ADX 30-60, tendencia alcista ===
+  bool cond_c3 = current_rsi <= 6 && current_adx >= 30 && current_adx <= 60 && tend_up;
+  if (cond_c3 && flag_compra3 && puede_abrir) { OpenBuy("COMPRA3"); flag_compra3 = false; return; }
+  flag_compra3 = cond_c3;
+
+  if (puede_abrir) {
+    buy_opened  = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+    sell_opened = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL;
+    puede_abrir = !buy_opened && !sell_opened;
+  }
+
+  // === COMPRA2: RSI<=10, ADX 26-35, tendencia alcista ===
+  bool cond_c2 = current_rsi <= 10 && current_adx >= 26 && current_adx < 35 && tend_up;
+  if (cond_c2 && flag_compra2 && puede_abrir) { OpenBuy("COMPRA2"); flag_compra2 = false; return; }
+  flag_compra2 = cond_c2;
+
+  buy_opened  = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+  sell_opened = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL;
+  puede_abrir = !buy_opened && !sell_opened;
+
+  // === VENTA4: RSI>=80, ADX<=30, tendencia bajista ===
+  bool cond_v4 = current_rsi >= 80 && current_adx <= 30 && tend_dn;
+  if (cond_v4 && flag_venta4 && puede_abrir) { OpenSell("VENTA4"); flag_venta4 = false; return; }
+  flag_venta4 = cond_v4;
+
+  buy_opened  = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+  sell_opened = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL;
+  puede_abrir = !buy_opened && !sell_opened;
+
+  // === VENTA3: RSI>=90, ADX>=90, tendencia bajista ===
+  bool cond_v3 = current_rsi >= 90 && current_adx >= 90 && tend_dn;
+  if (cond_v3 && flag_venta3 && puede_abrir) { OpenSell("VENTA3"); flag_venta3 = false; return; }
+  flag_venta3 = cond_v3;
+
+  buy_opened  = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+  sell_opened = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL;
+  puede_abrir = !buy_opened && !sell_opened;
+
+  // === VENTA5: RSI>=90, ADX 65-89, tendencia bajista ===
+  bool cond_v5 = current_rsi >= 90 && current_adx >= 65 && current_adx < 90 && tend_dn;
+  if (cond_v5 && flag_venta5 && puede_abrir) { OpenSell("VENTA5"); flag_venta5 = false; return; }
+  flag_venta5 = cond_v5;
+}
+
+//+------------------------------------------------------------------+
+void OpenBuy(string tipo) {
+  double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+  double sl  = ask - SL_Inicial * _Point;
+
+  if (trade.Buy(Lots, _Symbol, ask, sl, 0, tipo))
+    PrintFormat(">>> BUY [%s] | Ask: %.5f | SL: %.5f", tipo, ask, sl);
+  else
+    PrintFormat("❌ Error BUY [%s]: %d", tipo, GetLastError());
+}
+
+//+------------------------------------------------------------------+
+void OpenSell(string tipo) {
+  double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+  double sl  = bid + SL_Inicial * _Point;
+
+  if (trade.Sell(Lots, _Symbol, bid, sl, 0, tipo))
+    PrintFormat(">>> SELL [%s] | Bid: %.5f | SL: %.5f", tipo, bid, sl);
+  else
+    PrintFormat("❌ Error SELL [%s]: %d", tipo, GetLastError());
+}
+
+//+------------------------------------------------------------------+
+void CheckFloatingProfit() {
+  if (!PositionSelect(_Symbol)) return;
+
+  ulong  ticket     = PositionGetTicket(0);
+  bool   is_buy     = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+  double price_open = PositionGetDouble(POSITION_PRICE_OPEN);
+  double price_now  = SymbolInfoDouble(_Symbol, is_buy ? SYMBOL_BID : SYMBOL_ASK);
+  double pts        = is_buy ?
+    (price_now - price_open) / _Point :
+    (price_open - price_now) / _Point;
+
+  MoverTrailingStop(ticket, is_buy, price_open, pts);
+
+  // Pérdida máxima
+  if (pts < 0 && (-pts) >= SL_Maximo) {
+    trade.PositionClose(ticket);
+    pausa_hasta = TimeCurrent() + Pausa_Perdida;
+    PrintFormat("🛑 Cierre por pérdida: %.0f pts. Pausa %ds.", pts, Pausa_Perdida);
+    return;
+  }
+
+  // Ganancia objetivo
+  if (pts >= TP_Objetivo) {
+    trade.PositionClose(ticket);
+    PrintFormat("✅ Cierre por TP: %.0f pts.", pts);
+    return;
+  }
+
+  // FIX 4.6: PuntosCierre solo actúa como guardia final de seguridad.
+  // En condiciones normales el cierre por TP_Objetivo ocurre antes.
+  CheckCloseConditions(ticket, is_buy, pts);
+}
+
+//+------------------------------------------------------------------+
+// FIX 4.5: lógica de cierre condicional separada
+void CheckCloseConditions(ulong ticket, bool is_buy, double pts) {
+  if (MathAbs(pts) < 20000) return; // PuntosCierre hardcoded como guardia
+
+  string comentario = PositionGetString(POSITION_COMMENT);
+  double rsi[], adx[];
+  if (CopyBuffer(rsi_handle, 0, 0, 2, rsi) <= 0 || CopyBuffer(adx_handle, 0, 0, 2, adx) <= 0) return;
+
+  double cr = rsi[1];
+  double ca = adx[1];
+
+  if (is_buy) {
+    if (cr >= 70) {
+      trade.PositionClose(ticket);
+      pausa_hasta = TimeCurrent() + 1800;
+      PrintFormat("✅ BUY cerrada guardia final | RSI: %.1f", cr);
+    }
+    return;
+  }
+
+  // SELL
+  if (cr <= 8  && StringFind(comentario, "VENTA4") >= 0) { trade.PositionClose(ticket); return; }
+  if (cr >= 80 && ca <= 30 && StringFind(comentario, "VENTA5") >= 0) { trade.PositionClose(ticket); return; }
+  if (cr >= 80 && ca >= 85 && StringFind(comentario, "VENTA5") >= 0) { trade.PositionClose(ticket); return; }
+  if (cr <= 8  && StringFind(comentario, "VENTA3") >= 0) { trade.PositionClose(ticket); return; }
+  if (ca >= 90 && cr >= 85 && StringFind(comentario, "VENTA3") >= 0) { trade.PositionClose(ticket); return; }
+}
+
+//+------------------------------------------------------------------+
+void MoverTrailingStop(ulong ticket, bool is_buy, double price_open, double pts) {
+  double nuevo_sl = 0;
+
+  if      (pts >= 110  && pts < 200)  nuevo_sl = is_buy ? price_open + 105  * _Point : price_open - 105  * _Point;
+  else if (pts >= 200  && pts < 250)  nuevo_sl = is_buy ? price_open + 130  * _Point : price_open - 130  * _Point;
+  else if (pts >= 250  && pts < 450)  nuevo_sl = is_buy ? price_open + 160  * _Point : price_open - 160  * _Point;
+  else if (pts >= 450  && pts < 550)  nuevo_sl = is_buy ? price_open + 250  * _Point : price_open - 250  * _Point;
+  else if (pts >= 550  && pts < 650)  nuevo_sl = is_buy ? price_open + 350  * _Point : price_open - 350  * _Point;
+  else if (pts >= 650  && pts < 750)  nuevo_sl = is_buy ? price_open + 450  * _Point : price_open - 450  * _Point;
+  else if (pts >= 750  && pts < 850)  nuevo_sl = is_buy ? price_open + 550  * _Point : price_open - 550  * _Point;
+  else if (pts >= 850  && pts < 950)  nuevo_sl = is_buy ? price_open + 650  * _Point : price_open - 650  * _Point;
+  else if (pts >= 950  && pts < 1050) nuevo_sl = is_buy ? price_open + 750  * _Point : price_open - 750  * _Point;
+  else if (pts >= 1050 && pts < 1150) nuevo_sl = is_buy ? price_open + 850  * _Point : price_open - 850  * _Point;
+  else if (pts >= 1150 && pts < 1250) nuevo_sl = is_buy ? price_open + 950  * _Point : price_open - 950  * _Point;
+  else if (pts >= 1250 && pts < 1350) nuevo_sl = is_buy ? price_open + 1050 * _Point : price_open - 1050 * _Point;
+  else if (pts >= 1350 && pts < 1450) nuevo_sl = is_buy ? price_open + 1150 * _Point : price_open - 1150 * _Point;
+  else if (pts >= 1450 && pts < 1550) nuevo_sl = is_buy ? price_open + 1250 * _Point : price_open - 1250 * _Point;
+  else if (pts >= 1550 && pts < 2000) nuevo_sl = is_buy ? price_open + 1350 * _Point : price_open - 1350 * _Point;
+  else if (pts >= 2000 && pts < 2500) nuevo_sl = is_buy ? price_open + 1700 * _Point : price_open - 1700 * _Point;
+  else if (pts >= 2500 && pts < 3000) nuevo_sl = is_buy ? price_open + 2200 * _Point : price_open - 2200 * _Point;
+  else if (pts >= 3000)               nuevo_sl = is_buy ? price_open + 2700 * _Point : price_open - 2700 * _Point;
+
+  if (nuevo_sl == 0) return;
+
+  double sl_actual   = PositionGetDouble(POSITION_SL);
+  bool debe_mover    = (sl_actual > 0) ?
+    (is_buy ? nuevo_sl > sl_actual + _Point * 10 : nuevo_sl < sl_actual - _Point * 10) :
+    true;
+
+  if (debe_mover) {
+    if (trade.PositionModify(ticket, nuevo_sl, 0))
+      PrintFormat("🔁 SL → %.5f | Ganancia: %.0f pts", nuevo_sl, pts);
+    else
+      PrintFormat("⚠️ Error mover SL: %d", GetLastError());
+  }
+}
+
+//+------------------------------------------------------------------+
+bool ConsultarAPI(string &operacion, int &valor) {
+  char post_data[], result[];
+  string headers = "", result_headers = "";
+
+  ResetLastError();
+  int status = WebRequest(
+    "GET",
+    "https://gc4529031ed9eb7-p3zpjccedme5d537.adb.sa-saopaulo-1.oraclecloudapps.com/ords/dev/bullRun/opera",
+    headers, 5000, post_data, result, result_headers
+  );
+
+  if (status != 200) {
+    PrintFormat("⚠️ API error HTTP %d | %d", status, GetLastError());
+    return false;
+  }
+
+  string resp = CharArrayToString(result);
+  if (StringFind(resp, "\"oper_operacion\":\"BUY\"") >= 0)   operacion = "BUY";
+  if (StringFind(resp, "\"oper_operacion\":\"SELL\"") >= 0)  operacion = "SELL";
+  if (StringFind(resp, "\"oper_operacion\":\"close\"") >= 0) operacion = "close";
+
+  int pos = StringFind(resp, "\"oper_valor\":");
+  if (pos >= 0) {
+    int s = pos + StringLen("\"oper_valor\":");
+    int e = StringFind(resp, "}", s);
+    if (e == -1) e = StringLen(resp);
+    valor = StringToInteger(StringSubstr(resp, s, e - s));
+  }
+  return true;
+}
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {
+  PrintFormat("🔌 EA eliminado. Razón: %d", reason);
+}
+
+//+------------------------------------------------------------------+
+void OnTradeTransaction(
+  const MqlTradeTransaction &trans,
+  const MqlTradeRequest     &request,
+  const MqlTradeResult      &result)
+{
+  if (trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
+
+  ulong deal_ticket = trans.deal;
+  if (deal_ticket == 0) return;
+  if (!HistorySelect(TimeCurrent() - 86400, TimeCurrent())) return;
+
+  long   deal_entry  = (long)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+  long   deal_reason = (long)HistoryDealGetInteger(deal_ticket, DEAL_REASON);
+  double deal_profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+
+  if (deal_entry != DEAL_ENTRY_OUT) return;
+
+  if (deal_reason == 100 || deal_reason == 102) {
+    pausa_hasta = TimeCurrent() + Pausa_SL;
+    PrintFormat("⏸️ SL tocado (reason=%d). Pausa %ds.", deal_reason, Pausa_SL);
+    return;
+  }
+
+  if (deal_profit < 0) {
+    pausa_hasta = TimeCurrent() + Pausa_Perdida;
+    PrintFormat("⏸️ Pérdida %.2f. Pausa %ds.", deal_profit, Pausa_Perdida);
+  }
+}

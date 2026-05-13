@@ -104,8 +104,8 @@
 | `general_ares_v1.txt` | Original analizado | ✅ Guardado |
 | `general_ares_v2.txt` | Fase 1 — Bugs críticos corregidos | ✅ Completo |
 | `general_ares_v3.txt` | Fase 2 — Riesgo base | ✅ Completo |
-| `general_ares_v4.txt` | Fase 3 — Calidad de señales | ⏳ Pendiente |
-| `general_ares_v5.txt` | Fase 4 — Arquitectura limpia | ⏳ Pendiente |
+| `general_ares_v4.txt` | Fase 3 — Calidad de señales | ✅ Completo |
+| `general_ares_v5.txt` | Fase 4 — Arquitectura limpia | ✅ Completo |
 | `general_ares_v6.txt` | Fase 5 — Versión optimizada | ⏳ Pendiente |
 
 ---
