@@ -1,0 +1,453 @@
+//+------------------------------------------------------------------+
+//| Expert advisor: General Ares                                    |
+//| Autor: Cristhian Cano                                            |
+//| Version: v2 — Fase 1: corrección de bugs críticos               |
+//| Fecha: 2026-05-13                                                |
+//| Cambios vs v1:                                                   |
+//|   FIX 1.1 - Cierre BUY: current_rsi >= 8000 → >= 70             |
+//|   FIX 1.2 - Cierres SELL: comentarios COMPRA → VENTA correctos  |
+//|   FIX 1.3 - OnTradeTransaction: pausa solo si deal_profit < 0   |
+//|   FIX 1.4 - Trailing 950-1050 pts: 550 → 750 (evita regresión)  |
+//+------------------------------------------------------------------+
+#property strict#include <Trade\Trade.mqh>
+
+CTrade trade;
+
+//=== INPUTS DE CONFIGURACIÓN ===//
+int RSI_Period = 2;
+double RSI_Overbought = 80.0;
+double RSI_Oversold = 10.0;
+int ADX_Period = 5;
+double ADX_Level = 30.0;
+double Lots = 0.01;
+double PuntosCierre = 20000; // Cerrar en ±10.000 puntos
+
+//=== VARIABLES GLOBALES ===//
+int rsi_handle;
+int adx_handle;
+bool buy_opened = false;
+bool sell_opened = false;
+datetime pausa_hasta = TimeCurrent() - 100;
+
+string compra_ready = "N";
+string compra_ready2 = "N";
+string compra_ready3 = "N";
+string venta_ready = "N";
+string venta_ready1 = "N";
+string venta_ready3 = "N";
+string apagar = "N";
+
+datetime ultima_verificacion = 0;
+int intervalo_verificacion = 20;
+datetime ultima_verificacionap = 0;
+int intervalo_verificacionap = 5;
+
+bool autorizado = false;
+
+int ma_handle;
+double ma_value[];
+int MA_Period = 5;
+
+string api_url = "https://gc4529031ed9eb7-p3zpjccedme5d537.adb.sa-saopaulo-1.oraclecloudapps.com/ords/dev/bullRun/opera";
+int ultimo_oper_valor = -1;
+datetime ultima_consulta = 0;
+int intervalo_ms = 10000;
+string operacion1;
+int oper_valor1;
+
+
+//+------------------------------------------------------------------+
+int OnInit() {
+
+  rsi_handle = iRSI(_Symbol, PERIOD_M1, RSI_Period, PRICE_CLOSE);
+  adx_handle = iADX(_Symbol, PERIOD_M1, ADX_Period);
+
+  if (rsi_handle == INVALID_HANDLE || adx_handle == INVALID_HANDLE) {
+    return INIT_FAILED;
+  }
+
+  ma_handle = iMA(_Symbol, PERIOD_M1, MA_Period, 0, MODE_SMA, PRICE_CLOSE);
+  if (ma_handle == INVALID_HANDLE) {
+    return INIT_FAILED;
+  }
+
+  return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+void OnTick() {
+  ulong ticket = PositionGetTicket(0);
+
+  if (TimeCurrent() - ultima_verificacion > intervalo_verificacion) {
+    ultima_verificacion = TimeCurrent();
+  }
+
+  CheckFloatingProfit();
+
+  if (Bars(_Symbol, PERIOD_M1) < 10)
+    return;
+
+  if (TimeCurrent() < pausa_hasta)
+    return;
+
+  double rsi[], adx[];
+  int copied_rsi = CopyBuffer(rsi_handle, 0, 0, 2, rsi);
+  int copied_adx = CopyBuffer(adx_handle, 0, 0, 2, adx);
+
+  CopyBuffer(ma_handle, 0, 0, 1, ma_value);
+  double precio_actual = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+  bool tendencia_alcista = precio_actual > ma_value[0];
+  bool tendencia_bajista = precio_actual < ma_value[0];
+
+  if (copied_rsi <= 0 || copied_adx <= 0 || ArraySize(rsi) < 2 || ArraySize(adx) < 2)
+    return;
+
+  double current_rsi = rsi[1];
+  double current_adx = adx[1];
+
+  buy_opened = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+  sell_opened = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL;
+
+  // === COMPRA3 ===
+  if (current_rsi <= 6 && current_adx >= 30 && current_adx <= 60) {
+    compra_ready3 = "S";
+  }
+
+  if (apagar == "N" && TimeCurrent() > pausa_hasta && current_rsi <= 6 && current_adx >= 30 && current_adx <= 60 && !buy_opened && !sell_opened) {
+    OpenBuy("COMPRA3");
+    compra_ready3 = "N";
+  }
+  // FIN COMPRA3
+
+  buy_opened = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+  sell_opened = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL;
+
+  // === COMPRA2 ===
+  if (apagar == "N" && TimeCurrent() > pausa_hasta && current_rsi <= 10 && current_adx < 35 && current_adx >= 26 && !buy_opened && !sell_opened) {
+    OpenBuy("COMPRA2");
+    compra_ready3 = "N";
+  }
+  // FIN COMPRA2
+
+  buy_opened = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+  sell_opened = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL;
+
+  // === VENTA4 ===
+  if (apagar == "N" && TimeCurrent() > pausa_hasta && current_rsi >= 85 && current_adx <= 30 && !buy_opened && !sell_opened) {
+    OpenSell("VENTA4");
+  }
+  // FIN VENTA4
+
+  buy_opened = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+  sell_opened = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL;
+
+  // === VENTA3 ===
+  if (apagar == "N" && TimeCurrent() > pausa_hasta && current_rsi >= 90 && current_adx >= 90 && !buy_opened && !sell_opened) {
+    OpenSell("VENTA3");
+  }
+  // FIN VENTA3
+
+  buy_opened = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+  sell_opened = PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL;
+
+  // === VENTA5 ===
+  if (apagar == "N" && TimeCurrent() > pausa_hasta && current_rsi >= 90 && current_adx >= 65 && !buy_opened && !sell_opened) {
+    OpenSell("VENTA5");
+  }
+  // FIN VENTA5
+}
+
+//+------------------------------------------------------------------+
+void OpenBuy(string tipo_compra) {
+  double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+  if (trade.Buy(Lots, _Symbol, ask, 0, 0, tipo_compra))
+    Print(">>> COMPRA ejecutada [", tipo_compra, "] | Entrada: ", ask);
+  else
+    Print("❌ Error al abrir BUY [", tipo_compra, "] | Entrada: ", ask);
+}
+
+//+------------------------------------------------------------------+
+void OpenSell(string tipo_venta) {
+  double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+  if (trade.Sell(Lots, _Symbol, bid, 0, 0, tipo_venta))
+    Print(">>> VENTA ejecutada [", tipo_venta, "] | Entrada: ", bid);
+  else
+    Print("❌ Error al abrir SELL [", tipo_venta, "] | Entrada: ", bid);
+}
+
+//+------------------------------------------------------------------+
+void CheckFloatingProfit() {
+  string comentario = PositionGetString(POSITION_COMMENT);
+
+  if (!PositionSelect(_Symbol))
+    return;
+
+  ulong ticket = PositionGetTicket(0);
+  bool is_buy  = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+  bool is_sell = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL;
+  double price_open = PositionGetDouble(POSITION_PRICE_OPEN);
+  double price_now  = SymbolInfoDouble(_Symbol, is_buy ? SYMBOL_BID : SYMBOL_ASK);
+  double puntos_actuales = is_buy ?
+    (price_now - price_open) / _Point :
+    (price_open - price_now) / _Point;
+
+  // === TRAILING STOP ESCALONADO ===
+  double nuevo_sl = 0;
+  Print(puntos_actuales);
+
+  if (puntos_actuales >= 110 && puntos_actuales < 200) {
+    nuevo_sl = is_buy ? price_open + 105 * _Point : price_open - 105 * _Point;
+  }
+  if (puntos_actuales >= 250 && puntos_actuales < 450) {
+    nuevo_sl = is_buy ? price_open + 160 * _Point : price_open - 160 * _Point;
+  }
+  if (puntos_actuales > 450 && puntos_actuales < 550) {
+    nuevo_sl = is_buy ? price_open + 250 * _Point : price_open - 250 * _Point;
+  }
+  if (puntos_actuales >= 550 && puntos_actuales < 650) {
+    nuevo_sl = is_buy ? price_open + 350 * _Point : price_open - 350 * _Point;
+  }
+  if (puntos_actuales >= 650 && puntos_actuales < 750) {
+    nuevo_sl = is_buy ? price_open + 450 * _Point : price_open - 450 * _Point;
+  }
+  if (puntos_actuales >= 750 && puntos_actuales < 850) {
+    nuevo_sl = is_buy ? price_open + 550 * _Point : price_open - 550 * _Point;
+  }
+  if (puntos_actuales >= 850 && puntos_actuales < 950) {
+    nuevo_sl = is_buy ? price_open + 650 * _Point : price_open - 650 * _Point;
+  }
+  // FIX 1.4: era 550 (retrocedía), corregido a 750 para mantener progresión
+  if (puntos_actuales >= 950 && puntos_actuales < 1050) {
+    nuevo_sl = is_buy ? price_open + 750 * _Point : price_open - 750 * _Point;
+  }
+  if (puntos_actuales >= 1050 && puntos_actuales < 1150) {
+    nuevo_sl = is_buy ? price_open + 650 * _Point : price_open - 650 * _Point;
+  }
+  if (puntos_actuales >= 1150 && puntos_actuales < 1250) {
+    nuevo_sl = is_buy ? price_open + 750 * _Point : price_open - 750 * _Point;
+  }
+  if (puntos_actuales >= 1250 && puntos_actuales < 1350) {
+    nuevo_sl = is_buy ? price_open + 850 * _Point : price_open - 850 * _Point;
+  }
+  if (puntos_actuales >= 1350 && puntos_actuales < 1450) {
+    nuevo_sl = is_buy ? price_open + 950 * _Point : price_open - 950 * _Point;
+  }
+  if (puntos_actuales >= 1450 && puntos_actuales < 1550) {
+    nuevo_sl = is_buy ? price_open + 1050 * _Point : price_open - 1050 * _Point;
+  }
+  if (puntos_actuales >= 2000 && puntos_actuales < 2500) {
+    nuevo_sl = is_buy ? price_open + 1200 * _Point : price_open - 1200 * _Point;
+  }
+  if (puntos_actuales >= 2500 && puntos_actuales < 3000) {
+    nuevo_sl = is_buy ? price_open + 2000 * _Point : price_open - 2000 * _Point;
+  }
+
+  if (nuevo_sl > 0) {
+    double sl_actual = PositionGetDouble(POSITION_SL);
+    bool debe_mover_sl = false;
+
+    if (sl_actual > 0) {
+      debe_mover_sl = is_buy ?
+        (nuevo_sl > sl_actual + _Point * 10) :
+        (nuevo_sl < sl_actual - _Point * 10);
+    } else {
+      debe_mover_sl = true;
+    }
+
+    if (debe_mover_sl) {
+      if (trade.PositionModify(ticket, nuevo_sl, 0)) {
+        pausa_hasta = TimeCurrent() + 300;
+        Print("🔁 SL actualizado por trailing escalonado | Nuevo SL: ", nuevo_sl);
+      } else {
+        Print("⚠️ Error al mover SL escalonado: ", GetLastError());
+      }
+    }
+  }
+
+  // === Pérdida grave: cierre y pausa ===
+  if (puntos_actuales < 0 && (puntos_actuales * -1) >= 500) {
+    trade.PositionClose(ticket);
+    pausa_hasta = TimeCurrent() + 900;
+    return;
+  }
+
+  // === Ganancia objetivo: cierre directo ===
+  if (puntos_actuales >= 5000) {
+    trade.PositionClose(ticket);
+    return;
+  }
+
+  // === Cierre condicional por ±PuntosCierre ===
+  if (MathAbs(puntos_actuales) >= PuntosCierre) {
+    double rsi[], adx[];
+    int copied_rsi = CopyBuffer(rsi_handle, 0, 0, 2, rsi);
+    int copied_adx = CopyBuffer(adx_handle, 0, 0, 2, adx);
+
+    if (copied_rsi <= 0 || copied_adx <= 0 || ArraySize(rsi) == 0 || ArraySize(adx) == 0)
+      return;
+
+    double current_rsi = rsi[1];
+    double current_adx = adx[1];
+
+    if (is_buy) {
+      // FIX 1.1: era current_rsi >= 8000 (inalcanzable), corregido a >= 70
+      if (current_rsi >= 70) {
+        trade.PositionClose(ticket);
+        pausa_hasta = TimeCurrent() + 1800;
+        Print("✅ BUY cerrada por condición ±PuntosCierre | RSI: ", current_rsi, " | ADX: ", current_adx);
+        return;
+      }
+    } else { // SELL
+
+      // VENTA4: cierra cuando RSI vuelve a sobreventa
+      if (current_rsi <= 8 && StringFind(comentario, "VENTA4") >= 0) {
+        trade.PositionClose(ticket);
+        return;
+      }
+
+      // FIX 1.2: era "COMPRA2" — corregido a "VENTA5"
+      // VENTA5: cierra cuando RSI vuelve a sobrecompra con ADX débil
+      if (current_rsi >= 80 && current_adx <= 30 && StringFind(comentario, "VENTA5") >= 0) {
+        trade.PositionClose(ticket);
+        return;
+      }
+
+      // FIX 1.2: era "COMPRA3" — corregido a "VENTA5"
+      // VENTA5: cierra cuando RSI muy overbought con ADX alto
+      if (current_rsi >= 80 && current_adx >= 85 && StringFind(comentario, "VENTA5") >= 0) {
+        trade.PositionClose(ticket);
+        return;
+      }
+
+      // VENTA3: cierra cuando RSI vuelve a sobreventa
+      if (current_rsi <= 8 && StringFind(comentario, "VENTA3") >= 0) {
+        trade.PositionClose(ticket);
+        return;
+      }
+
+      // FIX 1.2: era "COMPRA3" — corregido a "VENTA3"
+      // VENTA3: cierra cuando ADX y RSI vuelven a extremo alcista
+      if (current_adx >= 90 && current_rsi >= 85 && StringFind(comentario, "VENTA3") >= 0) {
+        trade.PositionClose(ticket);
+        return;
+      }
+    }
+  }
+}
+
+//+------------------------------------------------------------------+
+void ClosePosition() {
+  if (PositionSelect(_Symbol)) {
+    ulong ticket = PositionGetTicket(0);
+    trade.PositionClose(ticket);
+  }
+}
+
+//+------------------------------------------------------------------+
+string ExtraerCampoMensaje(const string &respuesta) {
+  string clave = "\"message\":\"";
+  int inicio = StringFind(respuesta, clave);
+  if (inicio >= 0) {
+    inicio += StringLen(clave);
+    int fin = StringFind(respuesta, "\"", inicio);
+    if (fin > inicio)
+      return StringSubstr(respuesta, inicio, fin - inicio);
+  }
+  return "⚠️ No se pudo extraer el mensaje.";
+}
+
+//+------------------------------------------------------------------+
+bool ConsultarAPI(string &operacion, int &valor) {
+  string respuesta;
+  string headers = "";
+  char post_data[];
+  char result[];
+  string result_headers = "";
+  int timeout = 5000;
+
+  ResetLastError();
+
+  int status = WebRequest(
+    "GET",
+    "https://gc4529031ed9eb7-p3zpjccedme5d537.adb.sa-saopaulo-1.oraclecloudapps.com/ords/dev/bullRun/opera",
+    headers,
+    timeout,
+    post_data,
+    result,
+    result_headers
+  );
+
+  if (status != 200) {
+    Print("⚠️ Error al consultar API. Código HTTP: ", status, " - ", GetLastError());
+    return false;
+  }
+
+  respuesta = CharArrayToString(result);
+
+  if (StringFind(respuesta, "\"oper_operacion\":\"BUY\"") >= 0)  operacion = "BUY";
+  if (StringFind(respuesta, "\"oper_operacion\":\"SELL\"") >= 0) operacion = "SELL";
+  if (StringFind(respuesta, "\"oper_operacion\":\"close\"") >= 0) operacion = "close";
+
+  int pos_valor = StringFind(respuesta, "\"oper_valor\":");
+  if (pos_valor >= 0) {
+    int start_val = pos_valor + StringLen("\"oper_valor\":");
+    int end_val = StringFind(respuesta, "}", start_val);
+    if (end_val == -1) end_val = StringLen(respuesta);
+    string valor_str = StringSubstr(respuesta, start_val, end_val - start_val);
+    valor = StringToInteger(valor_str);
+  }
+
+  return true;
+}
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {
+  Print("🔌 EA eliminado. Razón: ", reason);
+}
+
+//+------------------------------------------------------------------+
+void OnTradeTransaction(
+  const MqlTradeTransaction &trans,
+  const MqlTradeRequest &request,
+  const MqlTradeResult &result)
+{
+  if (trans.type == TRADE_TRANSACTION_DEAL_ADD) {
+    ulong deal_ticket = trans.deal;
+    if (deal_ticket == 0) return;
+
+    if (!HistorySelect(TimeCurrent() - 86400, TimeCurrent())) {
+      Print("⚠️ HistorySelect falló al buscar el deal.");
+      return;
+    }
+
+    long deal_entry  = (long)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+    long deal_reason = (long)HistoryDealGetInteger(deal_ticket, DEAL_REASON);
+    string deal_comment = HistoryDealGetString(deal_ticket, DEAL_COMMENT);
+    double deal_profit  = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+    string sym = HistoryDealGetString(deal_ticket, DEAL_SYMBOL);
+
+    PrintFormat("🔔 Deal -> ticket: %I64u | symbol: %s | entry: %d | reason: %d | profit: %.2f | comment: %s",
+                deal_ticket, sym, deal_entry, deal_reason, deal_profit, deal_comment);
+
+    if (deal_entry == DEAL_ENTRY_OUT) {
+      int codigo_sl_1 = 100;
+      int codigo_sl_2 = 102;
+
+      // Pausa por SL detectado vía reason code
+      if (deal_reason == codigo_sl_1 || deal_reason == codigo_sl_2) {
+        pausa_hasta = TimeCurrent() + 900;
+        PrintFormat("⏸️ SL detectado (reason=%d). Pausa hasta %s", deal_reason, TimeToString(pausa_hasta, TIME_DATE|TIME_MINUTES));
+        return;
+      }
+
+      // FIX 1.3: era incondicional — ahora solo pausa si hubo pérdida
+      if (deal_profit < 0) {
+        pausa_hasta = TimeCurrent() + 900;
+        PrintFormat("⏸️ Cierre con pérdida (profit=%.2f). Pausa hasta %s", deal_profit, TimeToString(pausa_hasta, TIME_DATE|TIME_MINUTES));
+      }
+    }
+  }
+}
